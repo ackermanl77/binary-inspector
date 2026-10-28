@@ -139,6 +139,12 @@ python -m unittest discover -s tests -v
 - Sandbox behavior analysis is an import-only workflow. This app never launches a sample, configures a VM, or claims that an imported report is complete or authentic.
 - The report may contain strings embedded in the binary. Review it before sharing.
 
+## Privacy
+
+Binary Inspector works offline. It never uploads a file, a report or a hash. **Verify
+signature** asks Windows to check the signature using only locally cached certificate data
+(no network retrieval, no revocation check). A release may switch on the update check: once per launch it downloads a small version file from the release site and sends nothing but the app's name and version. There is no telemetry.
+
 ## Layout
 
 - `binary_inspector/pe.py` — bounded PE parser and report data model

@@ -1,0 +1,55 @@
+name: Release
+
+# On a version tag (git tag v0.1.0 && git push origin v0.1.0):
+#   1. runs the whole CI workflow (ruff, tests on 3.10 and 3.13, build + self-test);
+#   2. checks the tag against binary_inspector.__version__;
+#   3. builds with build.ps1 (notices regenerated, packaged --self-test) and publishes a GitHub
+#      Release with BinaryInspector.exe and SHA256SUMS.txt.
+# Prepared but not yet run: nothing has been tagged.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write  # create the Release and upload its files
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the tag against binary_inspector.__version__
+        shell: pwsh
+        run: |
+          $version = python -c "import binary_inspector; print(binary_inspector.__version__)"
+          if ("${{ github.ref_name }}" -ne "v$version") {
+            Write-Error "Tag ${{ github.ref_name }} does not match binary_inspector.__version__ ($version)"
+            exit 1
+          }
+
+      - name: Build and self-test
+        run: .\build.ps1
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\BinaryInspector.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  BinaryInspector.exe" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist\BinaryInspector.exe dist\SHA256SUMS.txt `
+            --title "Binary Inspector ${{ github.ref_name }}" --notes-file CHANGELOG.md

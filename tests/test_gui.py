@@ -8,8 +8,9 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from binary_inspector import findings
+from binary_inspector import errors, findings, update_check
 from binary_inspector.gui import InspectorWindow, sort_key
 from binary_inspector.pe import analyze_bytes
 from tests.test_pe import make_pe32, make_resource_pe
@@ -232,6 +233,39 @@ class NewToolsWindowTests(unittest.TestCase):
         self.assertIn("COMPARISON: old.exe -> new.exe", text)
         self.assertIn("kernel32.dll!ExitProcess", text)
         self.assertIn("rules:Demo [t]", text)
+
+
+@unittest.skipIf(_ROOT is None, "no Tk display")
+class ErrorAndUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.top = tk.Toplevel(_ROOT)
+        self.window = InspectorWindow(self.top)
+
+    def tearDown(self):
+        self.top.destroy()
+
+    def test_an_uncaught_callback_error_is_logged_and_shown(self):
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError as exc:
+            error = (type(exc), exc, exc.__traceback__)
+        with mock.patch("binary_inspector.gui.messagebox.showerror") as showerror:
+            self.top.report_callback_exception(*error)
+        log = errors.log_path().read_text(encoding="utf-8")
+        self.assertIn("RuntimeError: boom", log)
+        self.assertIn(str(errors.log_path()), showerror.call_args[0][1])
+
+    def test_an_update_offers_the_download_page(self):
+        info = update_check.UpdateInfo("9.0.0", "https://example.com/get", "Faster")
+        with mock.patch("binary_inspector.gui.messagebox.askyesno", return_value=True) as ask, \
+                mock.patch("binary_inspector.gui.webbrowser.open") as open_page:
+            self.window.show_update(info)
+        self.assertIn("9.0.0", ask.call_args[0][1])
+        open_page.assert_called_once_with("https://example.com/get")
+        with mock.patch("binary_inspector.gui.messagebox.askyesno", return_value=False), \
+                mock.patch("binary_inspector.gui.webbrowser.open") as open_page:
+            self.window.show_update(info)
+        open_page.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ name = "binary-inspector"
 version = "0.1.0"
 description = "A static, non-executing Windows PE inspection desktop app"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 
 [tool.ruff]
 line-length = 100

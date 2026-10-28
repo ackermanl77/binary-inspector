@@ -15,6 +15,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not install the pinned build requirements."
 }
 
+# THIRD_PARTY_NOTICES.md lists the packages actually being bundled; the spec ships it.
+& $python (Join-Path $root "scripts\third_party_notices.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not write THIRD_PARTY_NOTICES.md."
+}
+
 $arguments = @(
     "-m", "PyInstaller",
     "--noconfirm",

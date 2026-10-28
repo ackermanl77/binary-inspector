@@ -6,11 +6,12 @@ import json
 import queue
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
-from . import findings, settings
+from . import __version__, errors, findings, settings, update_check
 from .external_tools import decompile_dotnet, disassemble_native
 from .pe import Analysis, PEFormatError, analyze_file
 from .sandbox_report import SandboxReportError, load_sandbox_report
@@ -51,7 +52,27 @@ class InspectorWindow:
         self._tree_tables: set[str] = set()  # tables with a tree column (#0) to copy too
         self._build()
         self.apply_theme(self._settings["theme"])
+        self.root.report_callback_exception = self.report_error
         self.root.after(100, self._poll_results)
+
+    def report_error(self, exc_type, exc, tb) -> None:
+        """An uncaught exception in a Tk callback (or, via run_gui, a thread): log it and say so,
+        since the windowed exe has no console to print the traceback in."""
+        path = errors.record(exc_type, exc, tb)
+        where = f"\n\nThe details were saved to:\n{path}" if path else ""
+        self.status.set("Something went wrong; the details are in the error log.")
+        messagebox.showerror("Unexpected error", f"{exc_type.__name__}: {exc}{where}", parent=self.root)
+
+    def show_update(self, info: update_check.UpdateInfo) -> None:
+        self.status.set(f"Binary Inspector {info.version} is available.")
+        notes = f"\n\n{info.notes}" if info.notes else ""
+        if messagebox.askyesno(
+            "Update available",
+            f"Binary Inspector {info.version} is available (you have {__version__}).{notes}\n\n"
+            "Open the download page?",
+            parent=self.root,
+        ):
+            webbrowser.open(info.url)
 
     # ---- theme (light, dark, or as Windows is set) ----
 
@@ -985,5 +1006,13 @@ def _use_system_dpi() -> None:
 def run_gui() -> None:
     _use_system_dpi()
     root = tk.Tk()
-    InspectorWindow(root)
+    window = InspectorWindow(root)
+
+    def thread_excepthook(args: threading.ExceptHookArgs) -> None:
+        if args.exc_type is not SystemExit:
+            root.after(0, window.report_error, args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = thread_excepthook
+    # Does nothing until update_check.UPDATE_FEED_URL is set.
+    update_check.check_in_background(__version__, lambda info: root.after(0, window.show_update, info))
     root.mainloop()
