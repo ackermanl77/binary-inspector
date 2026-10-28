@@ -214,10 +214,17 @@ class InspectorWindow:
                         "=" * 72,
                         f"Status: {verification['status']}",
                         f"Status code: {verification['status_code']}",
-                        verification["detail"],
-                        "A trusted signature is not a safety verdict.",
                     ]
                 )
+                for key, label in (
+                    ("source", "Signature"),
+                    ("signer", "Signer"),
+                    ("issuer", "Issuer"),
+                    ("catalog", "Catalog"),
+                ):
+                    if verification.get(key):
+                        rendered.append(f"{label}: {verification[key]}")
+                rendered.extend([verification["detail"], "A trusted signature is not a safety verdict."])
         self._show_text("\n".join(rendered))
 
     @staticmethod
@@ -264,23 +271,27 @@ class InspectorWindow:
             f"SHA-256: {analysis.sha256}",
             f"Architecture: {analysis.architecture} ({analysis.pe_format})",
             f"Machine: 0x{analysis.machine:04X}",
-            f"PE timestamp (UTC): {analysis.timestamp_utc}",
+            f"PE timestamp (UTC): {analysis.timestamp_utc}"
+            + (" -- IN THE FUTURE" if analysis.timestamp_note == "in the future" else ""),
             f"Entry point RVA: 0x{analysis.entry_point_rva:X}",
             f"Image base: 0x{analysis.image_base:X}",
             f"Certificate table declared: {analysis.authenticode_table_declared}",
-            "",
-            "SECTIONS",
-            "-" * 72,
         ]
+        lines.extend(InspectorWindow._format_security(analysis))
+        lines.extend(["", "SECTIONS", "-" * 72])
         if analysis.sections:
             for section in analysis.sections:
                 lines.append(
                     f"{section.name:<10} RVA=0x{section.virtual_address:08X} "
+                    f"file=0x{section.raw_offset:08X} "
                     f"virtual={section.virtual_size:>10,} raw={section.raw_size:>10,} "
                     f"entropy={section.entropy:.4f} flags=0x{section.characteristics:08X}"
                 )
+                if section.flags:
+                    lines.append(f"{'':<10} {' '.join(section.flags)}")
         else:
             lines.append("(none)")
+        lines.extend(InspectorWindow._format_overlay(analysis))
         lines.extend(["", "IMPORTED DLLS AND FUNCTIONS", "-" * 72])
         if analysis.imports:
             for imported in analysis.imports:
@@ -304,19 +315,22 @@ class InspectorWindow:
             lines.append("(none)")
         lines.extend(["", "DEBUG INFORMATION", "-" * 72])
         for item in analysis.debug_info:
-            lines.append(f"Type {item.kind}; timestamp {item.timestamp_utc}")
+            lines.append(f"{item.kind_name or f'Type {item.kind}'} (type {item.kind}); timestamp {item.timestamp_utc}")
             if item.pdb_path:
                 lines.append(f"  PDB: {item.pdb_path}")
         if not analysis.debug_info:
             lines.append("(none)")
         lines.extend(["", "RESOURCES", "-" * 72])
         for item in analysis.resources:
+            kind = f"{item.type_name} ({item.type})" if item.type_name else item.type
             lines.append(
-                f"type={item.type} name={item.name} language={item.language} size={item.size}"
+                f"type={kind} name={item.name} language={item.language} size={item.size} "
+                f"file=0x{item.raw_offset:X}"
             )
             lines.extend(f"  {key}: {value}" for key, value in item.version_info.items())
         if not analysis.resources:
             lines.append("(none)")
+        lines.extend(InspectorWindow._format_manifest(analysis))
         lines.extend(["", "CLR METADATA", "-" * 72])
         if analysis.clr_info:
             lines.append(
@@ -340,6 +354,90 @@ class InspectorWindow:
         )
         lines.extend(analysis.strings or ["(none)"])
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_security(analysis: Analysis) -> list[str]:
+        security = analysis.security
+        if security is None:
+            return []
+
+        def mark(value) -> str:
+            return {True: "yes", False: "NO", None: "unknown"}.get(value, str(value))
+
+        lines = [
+            "",
+            "SECURITY MITIGATIONS (from headers; not a safety verdict)",
+            "-" * 72,
+            f"Subsystem: {security.subsystem}",
+            f"ASLR (dynamic base, relocations kept): {mark(security.aslr)}",
+            "High-entropy ASLR: "
+            + (mark(security.high_entropy_va) if analysis.pe_format == "PE32+" else "not applicable (32-bit)"),
+            f"DEP / NX: {mark(security.dep)}",
+            f"Control Flow Guard: {mark(security.control_flow_guard)}",
+            f"CET shadow stack compatible: {mark(security.cet_shadow_stack)}",
+            f"SafeSEH: {security.safe_seh}",
+            f"Stack cookie (/GS): "
+            + (mark(security.stack_cookie) if security.stack_cookie is not None else "unknown (no load configuration)"),
+            f"Signature required to load (FORCE_INTEGRITY): {mark(security.force_integrity)}",
+            f"DllCharacteristics: {', '.join(security.dll_characteristics) or '(none)'}",
+            f"File characteristics: {', '.join(security.file_characteristics) or '(none)'}",
+        ]
+        if security.tls_callbacks:
+            lines.append(
+                "TLS callbacks (run before the entry point): "
+                + ", ".join(f"RVA 0x{rva:X}" for rva in security.tls_callbacks)
+            )
+        if security.writable_executable_sections:
+            lines.append(
+                "Writable AND executable sections: " + ", ".join(security.writable_executable_sections)
+            )
+        if security.rich_header:
+            lines.append(f"Rich header: {len(security.rich_header)} tool entries (product id / build x objects)")
+            lines.extend(
+                f"  {entry.product_id:>4} / {entry.build:>5} x {entry.count}" for entry in security.rich_header
+            )
+        else:
+            lines.append("Rich header: none (not linked with Microsoft's linker, or removed)")
+        return lines
+
+    @staticmethod
+    def _format_overlay(analysis: Analysis) -> list[str]:
+        lines = ["", "OVERLAY (data after the last section)", "-" * 72]
+        overlay = analysis.overlay
+        if overlay is None:
+            return lines + ["(none)"]
+        lines.append(
+            f"Offset 0x{overlay.offset:X}, {overlay.size:,} bytes, entropy {overlay.entropy:.4f}"
+        )
+        lines.append(f"SHA-256: {overlay.sha256}")
+        if overlay.certificate_bytes:
+            rest = overlay.size - overlay.certificate_bytes
+            lines.append(
+                f"Authenticode certificate table: {overlay.certificate_bytes:,} bytes"
+                + (f"; {rest:,} other bytes" if rest else " (the whole overlay)")
+            )
+        if overlay.container:
+            lines.append(
+                f"Looks like: {overlay.container} (marker at 0x{overlay.container_offset:X}); a hint, not a verdict"
+            )
+        return lines
+
+    @staticmethod
+    def _format_manifest(analysis: Analysis) -> list[str]:
+        manifest = analysis.manifest
+        if manifest is None:
+            return []
+        lines = ["", "APPLICATION MANIFEST", "-" * 72]
+        lines.append(f"Requested execution level: {manifest.execution_level or '(not stated: asInvoker)'}")
+        if manifest.ui_access:
+            lines.append("uiAccess: true (may drive higher-integrity windows)")
+        if manifest.auto_elevate:
+            lines.append("autoElevate: true")
+        if manifest.dpi_awareness:
+            lines.append(f"DPI awareness: {manifest.dpi_awareness}")
+        if manifest.dependencies:
+            lines.append("Dependent assemblies: " + ", ".join(manifest.dependencies))
+        return lines
 
     def save_report(self) -> None:
         if self._analysis is None:

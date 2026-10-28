@@ -77,15 +77,31 @@ def make_version_block(key: str, value: bytes, value_type: int, children: bytes 
     block = bytearray(6) + key_data
     block.extend(bytes((-len(block)) % 4))
     block.extend(value)
-    block.extend(bytes((-len(block)) % 4))
-    block.extend(children)
+    if children:
+        block.extend(bytes((-len(block)) % 4))
+        block.extend(children)
     value_length = len(value) // 2 if value_type == 1 else len(value)
     struct.pack_into("<HHH", block, 0, len(block), value_length, value_type)
     return bytes(block)
 
 
+def version_siblings(*blocks: bytes) -> bytes:
+    """Blocks laid out as in a real resource: each starts on a 4-byte boundary, and a block's
+    length leaves out the padding after it."""
+    out = bytearray()
+    for block in blocks:
+        out.extend(bytes((-len(out)) % 4))
+        out.extend(block)
+    return bytes(out)
+
+
 def make_version_resource() -> bytes:
-    version = make_version_block("FileVersion", "1.2.3\0".encode("utf-16le"), 1)
+    # "1.2.34" is 7 UTF-16 units with its terminator, so its block ends off a 4-byte boundary.
+    version = version_siblings(
+        make_version_block("FileVersion", "1.2.34\0".encode("utf-16le"), 1),
+        make_version_block("ProductName", "Example\0".encode("utf-16le"), 1),
+        make_version_block("OriginalFilename", "example.exe\0".encode("utf-16le"), 1),
+    )
     table = make_version_block("040904B0", b"", 1, version)
     strings = make_version_block("StringFileInfo", b"", 1, table)
     return make_version_block("VS_VERSION_INFO", bytes(52), 0, strings)
@@ -232,7 +248,10 @@ class PEAnalysisTests(unittest.TestCase):
         report = analyze_bytes(make_resource_pe())
         version = next(item for item in report.resources if item.type == "16")
         self.assertEqual(version.language, "1033")
-        self.assertEqual(version.version_info["FileVersion"], "1.2.3")
+        self.assertEqual(
+            version.version_info,
+            {"FileVersion": "1.2.34", "ProductName": "Example", "OriginalFilename": "example.exe"},
+        )
 
     def test_rejects_resource_directory_cycles(self):
         data = bytearray(make_resource_pe())

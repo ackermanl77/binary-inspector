@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import struct
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from . import pe_details
+from .pe_details import Manifest, Overlay, PEFormatError, Security
 
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_SECTIONS = 96
@@ -25,7 +27,7 @@ MAX_TOTAL_VERSION_FIELDS = 10000
 MAX_EXPORTS = 10000
 MAX_DELAY_IMPORTS = 4096
 MAX_DEBUG_ENTRIES = 4096
-MAX_RESOURCE_ENTRIES = 4096
+MAX_RESOURCE_ENTRIES = 16384  # Notepad++ has ~5,000 directory entries (2,000+ icons)
 MAX_RESOURCE_DEPTH = 8
 MAX_VERSION_FIELDS = 256
 MAX_STRINGS = 2000
@@ -41,10 +43,6 @@ _MACHINE_NAMES = {
 }
 
 
-class PEFormatError(ValueError):
-    """Raised when a file is malformed or is not a supported PE image."""
-
-
 @dataclass(frozen=True)
 class Section:
     name: str
@@ -53,6 +51,8 @@ class Section:
     raw_size: int
     characteristics: int
     entropy: float
+    raw_offset: int = 0
+    flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,7 @@ class DebugInfo:
     kind: int
     timestamp_utc: str
     pdb_path: str | None
+    kind_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ class Resource:
     language: str
     size: int
     version_info: dict[str, str]
+    type_name: str = ""
+    raw_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,11 @@ class Analysis:
     clr_info: ClrInfo | None
     strings: tuple[str, ...]
     total_strings_found: int
+    timestamp_raw: int = 0
+    timestamp_note: str = ""  # "reproducible-build hash", "in the future", "not set" or ""
+    overlay: Overlay | None = None
+    manifest: Manifest | None = None
+    security: Security | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation of this report."""
@@ -148,18 +156,7 @@ def _cstring(data: bytes, offset: int, limit: int = 4096) -> str:
     return data[offset:end].decode("ascii", errors="replace")
 
 
-def _entropy(data: bytes) -> float:
-    if not data:
-        return 0.0
-    counts = [0] * 256
-    for value in data:
-        counts[value] += 1
-    length = len(data)
-    return -sum(
-        (count / length) * math.log2(count / length)
-        for count in counts
-        if count
-    )
+_entropy = pe_details.entropy
 
 
 def _readable_strings(data: bytes) -> tuple[tuple[str, ...], int]:
@@ -217,6 +214,9 @@ class _PE:
         self._metadata_text_bytes = 0
         self._version_resource_bytes = 0
         self._version_field_count = 0
+        self._reproducible = False
+        self._ex_dll_characteristics = 0
+        self._manifest_raw: bytes | None = None
 
     def _record_metadata_text(self, value: str) -> str:
         self._metadata_text_bytes += len(value.encode("utf-8", errors="replace"))
@@ -238,7 +238,7 @@ class _PE:
             raise PEFormatError("The PE signature is missing.")
 
         coff_offset = pe_offset + 4
-        machine, section_count, timestamp, _, _, optional_size, _ = _unpack(
+        machine, section_count, timestamp, _, _, optional_size, file_characteristics = _unpack(
             "<HHIIIHH", self.data, coff_offset
         )
         if section_count == 0 or section_count > MAX_SECTIONS:
@@ -268,6 +268,7 @@ class _PE:
             raise PEFormatError("The optional header is too small for this PE format.")
 
         entry_point = _unpack("<I", self.data, optional_offset + 16)[0]
+        subsystem, dll_characteristics = _unpack("<HH", self.data, optional_offset + 68)
         section_table = optional_end
         table_end = section_table + section_count * 40
         if table_end > len(self.data):
@@ -293,6 +294,8 @@ class _PE:
                     raw_size=raw_size,
                     characteristics=characteristics,
                     entropy=round(_entropy(raw), 4),
+                    raw_offset=raw_offset,
+                    flags=pe_details.flag_names(characteristics, pe_details.SECTION_FLAGS),
                 )
             )
 
@@ -379,11 +382,49 @@ class _PE:
             self._parse_clr(clr_rva, clr_size, rva_to_offset) if clr_rva and clr_size else None
         )
 
+        is64 = magic == 0x20B
+        load_config_rva, load_config_size = data_directory(10)
+        load_config = (
+            pe_details.parse_load_config(self.data, rva_to_offset(load_config_rva), load_config_size, is64)
+            if load_config_rva and load_config_size
+            else None
+        )
+        tls_rva, tls_size = data_directory(9)
+        tls_callbacks = (
+            pe_details.parse_tls_callbacks(self.data, rva_to_offset(tls_rva), is64, image_base, rva_to_offset)
+            if tls_rva and tls_size
+            else ()
+        )
+        security = pe_details.security_summary(
+            subsystem=subsystem,
+            dll_characteristics=dll_characteristics,
+            file_characteristics=file_characteristics,
+            is64=is64,
+            il_only=bool(clr_info and clr_info.flags & 0x1),
+            load_config=load_config,
+            ex_dll_characteristics=self._ex_dll_characteristics,
+            tls_callbacks=tls_callbacks,
+            sections=self.sections,
+            rich_header=pe_details.parse_rich_header(self.data, pe_offset),
+        )
+        sections_end = max(
+            [size_of_headers]
+            + [section.raw_offset + section.raw_size for section in self.sections if section.raw_size]
+        )
+        overlay = pe_details.find_overlay(self.data, sections_end, cert_offset, cert_size)
+        manifest = (
+            pe_details.parse_manifest(self._manifest_raw) if self._manifest_raw is not None else None
+        )
+        if manifest is not None:
+            self._record_metadata_text(manifest.text)
+
         strings, string_count = _readable_strings(self.data)
-        try:
-            timestamp_utc = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
-        except (OverflowError, OSError, ValueError):
-            timestamp_utc = "unavailable"
+        timestamp_utc, timestamp_note = pe_details.describe_timestamp(timestamp, self._reproducible)
+        if self._reproducible:  # the debug records carry the same hash, not a time
+            debug_info = [
+                DebugInfo(item.kind, "not a date (reproducible build)", item.pdb_path, item.kind_name)
+                for item in debug_info
+            ]
         return Analysis(
             file_name=file_name,
             file_size=len(self.data),
@@ -404,6 +445,11 @@ class _PE:
             clr_info=clr_info,
             strings=strings,
             total_strings_found=string_count,
+            timestamp_raw=timestamp,
+            timestamp_note=timestamp_note,
+            overlay=overlay,
+            manifest=manifest,
+            security=security,
         )
 
     def _parse_thunks(self, thunk_rva: int, rva_to_offset, thunk_width: int) -> tuple[str, ...]:
@@ -440,12 +486,11 @@ class _PE:
     def _parse_imports(
         self, import_rva: int, import_size: int, rva_to_offset, thunk_width: int
     ) -> None:
-        if import_size % 20:
-            raise PEFormatError(
-                "The import directory size is not a multiple of its descriptor size."
-            )
+        # The loader walks descriptors to the all-zero one and ignores the size, which some
+        # linkers (MinGW ld) set to the whole .idata section; the terminator must still fall
+        # within the declared size, rounded up to a whole descriptor.
         descriptor_offset = rva_to_offset(import_rva)
-        max_descriptors = min(MAX_IMPORT_DESCRIPTORS, import_size // 20)
+        max_descriptors = min(MAX_IMPORT_DESCRIPTORS, -(-import_size // 20))
         for descriptor_index in range(max_descriptors):
             offset = descriptor_offset + descriptor_index * 20
             fields = _unpack("<IIIII", self.data, offset)
@@ -520,12 +565,9 @@ class _PE:
     def _parse_delay_imports(
         self, delay_rva: int, delay_size: int, rva_to_offset, thunk_width: int, image_base: int
     ) -> list[DelayImport]:
-        if delay_size % 32:
-            raise PEFormatError(
-                "The delay-import directory size is not a multiple of its descriptor size."
-            )
+        # As for imports: walked to the all-zero descriptor within the size, rounded up.
         descriptor_offset = rva_to_offset(delay_rva)
-        max_descriptors = min(MAX_DELAY_IMPORTS, delay_size // 32)
+        max_descriptors = min(MAX_DELAY_IMPORTS, -(-delay_size // 32))
         results = []
         for index in range(max_descriptors):
             fields = _unpack("<IIIIIIII", self.data, descriptor_offset + index * 32)
@@ -569,13 +611,18 @@ class _PE:
                             "utf-8", errors="replace"
                         )
                         pdb_path = self._record_metadata_text(pdb_path)
+                if kind == pe_details.DEBUG_EX_DLLCHARACTERISTICS and len(raw) >= 4:
+                    self._ex_dll_characteristics = struct.unpack_from("<I", raw)[0]
             elif data_size:
                 raise PEFormatError("A debug data record extends beyond the end of the file.")
+            if kind == pe_details.DEBUG_REPRO:
+                self._reproducible = True
             try:
                 timestamp_utc = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
             except (OverflowError, OSError, ValueError):
                 timestamp_utc = "unavailable"
-            results.append(DebugInfo(kind, timestamp_utc, pdb_path))
+            kind_name = pe_details.DEBUG_TYPES.get(kind, f"type {kind}")
+            results.append(DebugInfo(kind, timestamp_utc, pdb_path, kind_name))
         return results
 
     @staticmethod
@@ -634,7 +681,9 @@ class _PE:
                 if child_length == 0:
                     break
                 previous = cursor
-                cursor = parse_block(cursor, end, path, depth + 1)
+                # Sibling blocks start on 4-byte boundaries; a block ending after an
+                # odd-length value is followed by padding.
+                cursor = (parse_block(cursor, end, path, depth + 1) + 3) & ~3
                 if cursor <= previous:
                     break
             return end
@@ -708,6 +757,10 @@ class _PE:
                         self._record_metadata_text(value)
                 else:
                     version_info = {}
+                if resource_type == "24" and self._manifest_raw is None:  # the first RT_MANIFEST
+                    if size > pe_details.MAX_MANIFEST_BYTES:
+                        raise PEFormatError("A manifest resource exceeded its parsing limit.")
+                    self._manifest_raw = self.data[data_offset : data_offset + size]
                 for item in next_path:
                     self._record_metadata_text(item)
                 results.append(
@@ -717,6 +770,8 @@ class _PE:
                         next_path[2] if len(next_path) > 2 else "",
                         size,
                         version_info,
+                        type_name=pe_details.RESOURCE_TYPES.get(resource_type, ""),
+                        raw_offset=data_offset,
                     )
                 )
                 if len(results) > MAX_RESOURCE_ENTRIES:
