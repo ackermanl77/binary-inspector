@@ -38,8 +38,9 @@ if (-not (Test-Path -LiteralPath $executable)) {
     throw "Build finished without producing $executable"
 }
 
-& $executable --self-test
-if ($LASTEXITCODE -ne 0) {
+# --windowed builds a GUI-subsystem executable, which `&` does not wait for; wait for its exit code.
+$selfTest = Start-Process -FilePath $executable -ArgumentList "--self-test" -Wait -PassThru
+if ($selfTest.ExitCode -ne 0) {
     throw "The packaged executable self-test failed."
 }
 

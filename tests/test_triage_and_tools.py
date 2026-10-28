@@ -22,7 +22,7 @@ from binary_inspector import dotnet, settings, triage
 from binary_inspector.__main__ import main
 from binary_inspector.compare import compare_analyses, format_comparison
 from binary_inspector.pe import Import, analyze_bytes, imphash, pe_checksum
-from tests.test_pe import make_pe32, make_pe32plus, set_directory
+from tests.test_pe import make_pe32, make_pe32plus
 
 
 class HashTests(unittest.TestCase):

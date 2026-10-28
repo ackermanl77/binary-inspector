@@ -888,7 +888,7 @@ class InspectorWindow:
             f"Control Flow Guard: {mark(security.control_flow_guard)}",
             f"CET shadow stack compatible: {mark(security.cet_shadow_stack)}",
             f"SafeSEH: {security.safe_seh}",
-            f"Stack cookie (/GS): "
+            "Stack cookie (/GS): "
             + (mark(security.stack_cookie) if security.stack_cookie is not None else "unknown (no load configuration)"),
             f"Signature required to load (FORCE_INTEGRITY): {mark(security.force_integrity)}",
             f"DllCharacteristics: {', '.join(security.dll_characteristics) or '(none)'}",
