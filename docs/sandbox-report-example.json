@@ -1,0 +1,20 @@
+{
+  "schema": "binary-inspector-sandbox-v1",
+  "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "events": [
+    {
+      "category": "process",
+      "action": "process-created",
+      "target": "sample.exe",
+      "details": "Example only; replace with an observation from an isolated sandbox.",
+      "timestamp": "2026-10-27T12:00:00Z"
+    },
+    {
+      "category": "file",
+      "action": "file-written",
+      "target": "%TEMP%\\example.tmp",
+      "details": "Example only; this project does not execute samples.",
+      "timestamp": "2026-10-27T12:00:01Z"
+    }
+  ]
+}
