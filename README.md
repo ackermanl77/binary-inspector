@@ -143,7 +143,7 @@ python -m unittest discover -s tests -v
 
 Binary Inspector works offline. It never uploads a file, a report or a hash. **Verify
 signature** asks Windows to check the signature using only locally cached certificate data
-(no network retrieval, no revocation check). A release may switch on the update check: once per launch it downloads a small version file from the release site and sends nothing but the app's name and version. There is no telemetry.
+(no network retrieval, no revocation check). Once per launch the app checks for a newer release: it downloads a small version file (update.json) from this project's GitHub Releases and sends nothing but the app's name and version. To turn that off, set the environment variable BINARY_INSPECTOR_UPDATE_FEED_URL to off. There is no telemetry.
 
 ## Layout
 

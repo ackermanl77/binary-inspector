@@ -19,7 +19,7 @@ All notable changes to Binary Inspector. The format follows
 - Import of sandbox behaviour reports, and optional Rizin / ILSpyCmd integration.
 - An error log: an unexpected error is shown in a dialog and written to `error.log` next to
   `settings.json` (the windowed exe has no console).
-- An update check that stays off until a release feed is configured (`update_check.py`).
+- A once-per-launch update check against the project's GitHub Releases (update.json) (`update_check.py`).
 - GitHub Actions CI: ruff and the tests on Python 3.10 and 3.13, then the build and its
   packaged `--self-test`. Dependabot and a `pip-audit` job watch the dependencies.
 - The MIT license, `THIRD_PARTY_NOTICES.md` (shipped inside the exe), `SECURITY.md` and a
