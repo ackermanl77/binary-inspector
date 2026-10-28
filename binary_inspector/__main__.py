@@ -11,6 +11,7 @@ from .external_tools import ToolError, decompile_dotnet, disassemble_native
 from .pe import PEFormatError, analyze_file
 from .sandbox_report import SandboxReportError, load_sandbox_report
 from .signature import verify_authenticode
+from .yara_scan import YaraError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,7 +19,11 @@ def main(argv: list[str] | None = None) -> int:
         prog="binary-inspector",
         description="Inspect Windows PE metadata without executing the selected file.",
     )
-    parser.add_argument("file", nargs="?", help="Path to a local .exe or .dll; omit to open the desktop UI.")
+    parser.add_argument(
+        "file",
+        nargs="?",
+        help="A local .exe or .dll, or a folder for batch mode (needs --out); omit to open the desktop UI.",
+    )
     parser.add_argument("--json", dest="json_path", help="Write the JSON report to this path instead of stdout.")
     parser.add_argument(
         "--disassemble",
@@ -40,6 +45,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Import a normalized JSON behavior report exported by an isolated external sandbox.",
     )
     parser.add_argument(
+        "--compare",
+        metavar="OTHER",
+        help="Also analyse OTHER and report what changed from FILE to OTHER (sections, imports, version...).",
+    )
+    parser.add_argument(
+        "--yara",
+        metavar="RULES",
+        help="Scan with these YARA rules (a .yar file or a folder of them); needs yara-python.",
+    )
+    parser.add_argument("--out", metavar="DIR", help="Batch mode: where to write one JSON per file and summary.csv.")
+    parser.add_argument("--recursive", action="store_true", help="Batch mode: include subfolders.")
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="Check packaged application imports and exit without opening the GUI.",
@@ -53,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
             or args.decompile_dotnet
             or args.verify_signature
             or args.sandbox_report
+            or args.compare
+            or args.yara
+            or args.out
         ):
             parser.error("--self-test cannot be combined with analysis options")
         return 0
@@ -63,12 +83,20 @@ def main(argv: list[str] | None = None) -> int:
             or args.decompile_dotnet
             or args.verify_signature
             or args.sandbox_report
+            or args.compare
+            or args.yara
+            or args.out
         ):
             parser.error("Analysis options require an input file")
         from .gui import run_gui
 
         run_gui()
         return 0
+
+    if Path(args.file).is_dir():
+        return _batch(parser, args)
+    if args.out or args.recursive:
+        parser.error("--out and --recursive are for a folder (batch mode)")
 
     try:
         analysis = analyze_file(args.file)
@@ -93,6 +121,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.sandbox_report:
             sandbox = load_sandbox_report(args.sandbox_report, analysis.sha256)
             extensions["sandbox_behavior"] = sandbox.to_dict()
+        if args.compare:
+            from .compare import compare_analyses
+
+            extensions["comparison"] = compare_analyses(analysis, analyze_file(args.compare))
+        if args.yara:
+            from .yara_scan import matches_to_dict, scan_file
+
+            extensions["yara"] = matches_to_dict(scan_file(args.file, args.yara), args.yara)
         if extensions:
             report_data["extended_analysis"] = extensions
         report = json.dumps(report_data, indent=2, ensure_ascii=True) + "\n"
@@ -100,9 +136,30 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.json_path).write_text(report, encoding="utf-8")
         else:
             sys.stdout.write(report)
-    except (PEFormatError, ToolError, SandboxReportError, OSError) as exc:
+    except (PEFormatError, ToolError, SandboxReportError, YaraError, OSError) as exc:
         print(f"Analysis failed: {exc}", file=sys.stderr)
         return 2
+    return 0
+
+
+def _batch(parser: argparse.ArgumentParser, args) -> int:
+    if not args.out:
+        parser.error("A folder needs --out DIR for the reports (batch mode)")
+    if args.json_path or args.disassemble or args.decompile_dotnet or args.sandbox_report or args.compare or args.yara:
+        parser.error("Batch mode supports --out, --recursive and --verify-signature only")
+    from .batch import run_batch
+
+    def progress(index: int, total: int, path: Path) -> None:
+        print(f"[{index}/{total}] {path.name}", file=sys.stderr)
+
+    try:
+        analysed, failed = run_batch(
+            args.file, args.out, recursive=args.recursive, verify_signatures=args.verify_signature, on_file=progress
+        )
+    except (ValueError, OSError) as exc:
+        print(f"Batch failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"Analysed {analysed} file(s), {failed} could not be analysed; see {Path(args.out) / 'summary.csv'}.")
     return 0
 
 

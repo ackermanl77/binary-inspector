@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import json
 import os
+import re
 import struct
-from dataclasses import asdict, dataclass
+import sys
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import pe_details
+from . import dotnet, pe_details, triage
+from .dotnet import DotNetMetadata
+from .ordinals import ORDINAL_NAMES
 from .pe_details import Manifest, Overlay, PEFormatError, Security
+from .triage import ApiHint, ToolchainHint
 
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_SECTIONS = 96
@@ -53,6 +59,7 @@ class Section:
     entropy: float
     raw_offset: int = 0
     flags: tuple[str, ...] = ()
+    sha256: str = ""  # of the section's raw data
 
 
 @dataclass(frozen=True)
@@ -130,6 +137,15 @@ class Analysis:
     overlay: Overlay | None = None
     manifest: Manifest | None = None
     security: Security | None = None
+    md5: str = ""
+    sha1: str = ""
+    imphash: str = ""  # pefile-compatible MD5 of the import list; "" when there are no imports
+    checksum_stored: int = 0
+    checksum_computed: int = 0
+    string_categories: tuple[str, ...] = ()  # one per entry of `strings`: url, ip, path... or ""
+    api_hints: tuple[ApiHint, ...] = ()
+    toolchain_hints: tuple[ToolchainHint, ...] = ()
+    dotnet: DotNetMetadata | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation of this report."""
@@ -159,49 +175,75 @@ def _cstring(data: bytes, offset: int, limit: int = 4096) -> str:
 _entropy = pe_details.entropy
 
 
-def _readable_strings(data: bytes) -> tuple[tuple[str, ...], int]:
-    found: list[str] = []
+def imphash(imports) -> str:
+    """The MD5 of the "library.function" list as pefile's get_imphash() builds it: lowercase,
+    .dll/.ocx/.sys dropped, ordinals named from pefile's tables (ordinals.py) or written ordN.
+    Empty when there are no imports."""
+    parts: list[str] = []
+    for entry in imports:
+        library = entry.library.lower()
+        stem, dot, extension = library.rpartition(".")
+        prefix = stem if dot and extension in ("dll", "ocx", "sys") else library
+        names = ORDINAL_NAMES.get(library, {})
+        for function in entry.functions:
+            if function.startswith("ordinal_"):
+                ordinal = int(function[len("ordinal_"):])
+                function = names.get(ordinal, f"ord{ordinal}")
+            parts.append(f"{prefix}.{function.lower()}")
+    return hashlib.md5(",".join(parts).encode("ascii", "replace")).hexdigest() if parts else ""
+
+
+def pe_checksum(data: bytes, checksum_offset: int) -> int:
+    """The optional-header CheckSum as MapFileAndCheckSum computes it: a 16-bit one's-complement
+    sum of the file with the CheckSum field taken as zero, plus the file length."""
+    if checksum_offset % 2:
+        data = bytearray(data)
+        data[checksum_offset : checksum_offset + 4] = bytes(4)
+        skip = ()
+    else:
+        skip = (checksum_offset // 2, checksum_offset // 2 + 1)
+    words = array.array("H")
+    words.frombytes(bytes(data) + b"\0" * (len(data) % 2) if len(data) % 2 or checksum_offset % 2 else data)
+    if sys.byteorder == "big":
+        words.byteswap()
+    total = sum(words) - sum(words[index] for index in skip)
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total + len(data)
+
+
+_ASCII_RUN = re.compile(rb"[\x20-\x7e]{%d,}" % MIN_STRING_LENGTH)
+_UTF16_RUN = re.compile(rb"(?:[\x20-\x7e]\x00){%d,}" % MIN_STRING_LENGTH)
+
+
+def _readable_strings(data: bytes) -> tuple[tuple[str, ...], tuple[str, ...], int]:
+    """Printable ASCII and UTF-16LE runs: (kept strings, their categories, total found). Strings
+    that look like URLs, addresses, paths, registry keys or encoded data are kept first, so the
+    MAX_STRINGS cap keeps the useful ones; the rest follow in file order."""
+    notable: list[tuple[str, str]] = []
+    plain: list[str] = []
     seen: set[str] = set()
     total = 0
-
-    def add(value: str) -> None:
-        nonlocal total
+    runs = (
+        [match.group().decode("ascii") for match in _ASCII_RUN.finditer(data)]
+        + [match.group().decode("utf-16le") for match in _UTF16_RUN.finditer(data)]
+    )
+    for value in runs:
         value = value.strip()
         if len(value) < MIN_STRING_LENGTH:
-            return
+            continue
         total += 1
-        if value not in seen and len(found) < MAX_STRINGS:
-            seen.add(value)
-            found.append(value[:MAX_STRING_LENGTH])
-
-    start = None
-    for index, value in enumerate(data):
-        if 32 <= value <= 126:
-            if start is None:
-                start = index
-        elif start is not None:
-            add(data[start:index].decode("ascii", errors="ignore"))
-            start = None
-    if start is not None:
-        add(data[start:].decode("ascii", errors="ignore"))
-
-    for alignment in (0, 1):
-        start = None
-        index = alignment
-        while index + 1 < len(data):
-            low, high = data[index], data[index + 1]
-            printable = high == 0 and 32 <= low <= 126
-            if printable and start is None:
-                start = index
-            elif not printable and start is not None:
-                raw = data[start:index]
-                add(raw.decode("utf-16le", errors="ignore"))
-                start = None
-            index += 2
-        if start is not None:
-            add(data[start:index].decode("utf-16le", errors="ignore"))
-
-    return tuple(found), total
+        if value in seen or len(notable) >= MAX_STRINGS:
+            continue
+        seen.add(value)
+        value = value[:MAX_STRING_LENGTH]
+        category = triage.string_category(value)
+        if category:
+            notable.append((value, category))
+        elif len(plain) < MAX_STRINGS:
+            plain.append(value)
+    kept = notable + [(value, "") for value in plain[: MAX_STRINGS - len(notable)]]
+    return tuple(value for value, _ in kept), tuple(category for _, category in kept), total
 
 
 class _PE:
@@ -217,6 +259,7 @@ class _PE:
         self._reproducible = False
         self._ex_dll_characteristics = 0
         self._manifest_raw: bytes | None = None
+        self._dotnet: DotNetMetadata | None = None
 
     def _record_metadata_text(self, value: str) -> str:
         self._metadata_text_bytes += len(value.encode("utf-8", errors="replace"))
@@ -294,6 +337,7 @@ class _PE:
                     raw_size=raw_size,
                     characteristics=characteristics,
                     entropy=round(_entropy(raw), 4),
+                    sha256=hashlib.sha256(raw).hexdigest() if raw else "",
                     raw_offset=raw_offset,
                     flags=pe_details.flag_names(characteristics, pe_details.SECTION_FLAGS),
                 )
@@ -418,14 +462,14 @@ class _PE:
         if manifest is not None:
             self._record_metadata_text(manifest.text)
 
-        strings, string_count = _readable_strings(self.data)
+        strings, string_categories, string_count = _readable_strings(self.data)
         timestamp_utc, timestamp_note = pe_details.describe_timestamp(timestamp, self._reproducible)
         if self._reproducible:  # the debug records carry the same hash, not a time
             debug_info = [
                 DebugInfo(item.kind, "not a date (reproducible build)", item.pdb_path, item.kind_name)
                 for item in debug_info
             ]
-        return Analysis(
+        analysis = Analysis(
             file_name=file_name,
             file_size=len(self.data),
             sha256=hashlib.sha256(self.data).hexdigest(),
@@ -450,7 +494,17 @@ class _PE:
             overlay=overlay,
             manifest=manifest,
             security=security,
+            md5=hashlib.md5(self.data).hexdigest(),
+            sha1=hashlib.sha1(self.data).hexdigest(),
+            imphash=imphash(self.imports),
+            checksum_stored=_unpack("<I", self.data, optional_offset + 64)[0],
+            checksum_computed=pe_checksum(self.data, optional_offset + 64),
+            string_categories=string_categories,
+            api_hints=triage.api_hints(tuple(self.imports) + tuple(delay_imports)),
+            dotnet=self._dotnet,
         )
+        # The toolchain hints read the finished report (sections, strings, overlay, Rich header).
+        return replace(analysis, toolchain_hints=triage.toolchain_hints(analysis, self.data))
 
     def _parse_thunks(self, thunk_rva: int, rva_to_offset, thunk_width: int) -> tuple[str, ...]:
         ordinal_mask = 1 << (thunk_width * 8 - 1)
@@ -798,6 +852,15 @@ class _PE:
             if metadata_rva > 0xFFFFFFFF - metadata_size + 1:
                 raise PEFormatError("The CLR metadata RVA range overflows.")
             rva_to_offset(metadata_rva + metadata_size - 1)
+            # ReadyToRun (precompiled native code): the ManagedNativeHeader directory points at "RTR".
+            native_rva, native_size = _unpack("<II", self.data, offset + 64)
+            ready_to_run = False
+            if native_rva and native_size >= 4:
+                native_offset = rva_to_offset(native_rva)
+                ready_to_run = self.data[native_offset : native_offset + 4] == b"RTR\0"
+            self._dotnet = dotnet.read_metadata(
+                self.data[metadata_offset : metadata_offset + metadata_size], flags, ready_to_run
+            )
         return ClrInfo(major, minor, metadata_rva, metadata_size, flags, entry_point)
 
 
