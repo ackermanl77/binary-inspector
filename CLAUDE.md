@@ -15,8 +15,12 @@ importer (`sandbox_report.py`). Standard library only at runtime; PyInstaller fo
 python -m binary_inspector                                    # GUI
 python -m binary_inspector path\to\program.exe --json out.json
 python -m unittest discover -s tests -v
+python -m ruff check .                                        # CI pins ruff 0.6.9
 .\build.ps1                                                   # dist\BinaryInspector.exe, then --self-test
 ```
+
+CI (`.github/workflows/ci.yml`, Windows): ruff + the tests on Python 3.10 and 3.13, then `build.ps1`
+and the packaged `--self-test`; the executable is uploaded as the `BinaryInspector` artifact.
 
 ## Rules
 

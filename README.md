@@ -71,6 +71,10 @@ Click a column header to sort it (numbers and hex values sort by value; click ag
 
 Use **Save report** to export the displayed report as JSON. On Windows, **Verify signature** checks the selected file against cached local trust data. The app does not submit samples or reports to a network service.
 
+### Continuous integration
+
+Every push to `master` and every pull request runs `.github/workflows/ci.yml` on Windows: `ruff check` and the unit tests on Python 3.10 (the oldest supported) and 3.13, then `build.ps1` with its packaged `--self-test`. The built `BinaryInspector.exe` is attached to the run as the `BinaryInspector` artifact.
+
 ### Build the Windows executable
 
 On Windows with Python installed:
