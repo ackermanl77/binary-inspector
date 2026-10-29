@@ -8,6 +8,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from binary_inspector import errors, findings, update_check
@@ -40,6 +41,20 @@ class SortKeyTests(unittest.TestCase):
     def test_numbers_hex_and_text(self):
         values = ["0x1A", "text", "9", "1,200", "0x2", "Alpha"]
         self.assertEqual(sorted(values, key=sort_key), ["0x2", "9", "0x1A", "1,200", "Alpha", "text"])
+
+
+class DroppedFileTests(unittest.TestCase):
+    def test_one_dropped_path_uses_the_regular_open_flow(self):
+        window = SimpleNamespace(open_file=mock.Mock(), status=mock.Mock())
+        InspectorWindow._open_dropped_files(window, (r"C:\samples\app.exe",))
+        window.open_file.assert_called_once_with(r"C:\samples\app.exe")
+        window.status.set.assert_not_called()
+
+    def test_multiple_dropped_paths_are_rejected_with_guidance(self):
+        window = SimpleNamespace(open_file=mock.Mock(), status=mock.Mock())
+        InspectorWindow._open_dropped_files(window, (r"C:\samples\a.exe", r"C:\samples\b.dll"))
+        window.open_file.assert_not_called()
+        window.status.set.assert_called_once_with("Drop one executable at a time.")
 
 
 class FindingTests(unittest.TestCase):

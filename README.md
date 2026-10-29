@@ -50,7 +50,7 @@ Requires Python 3.10+ and Tkinter (included with standard Windows Python install
 python -m binary_inspector
 ```
 
-Choose **Open executable** to analyze a file. The report is split into tabs:
+Choose **Open executable** or drop one executable onto the window to analyze a file. The report is split into tabs:
 
 - **Summary:** the key facts (hashes, architecture, timestamp, signature, version) and notes on what deserves a look first. The notes are colour-coded: green for a protection in place, orange for something to check. They are hints, not a verdict.
 - **Sections, Imports, Exports, Resources:** tables. Imports are grouped by DLL, and version fields appear under their resource.

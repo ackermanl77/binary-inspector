@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import sys
 import threading
 import tkinter as tk
 import webbrowser
@@ -17,6 +18,7 @@ from .pe import Analysis, PEFormatError, analyze_file
 from .sandbox_report import SandboxReportError, load_sandbox_report
 from .signature import verify_authenticode
 from . import triage
+from .windows_dnd import WindowsFileDropTarget
 
 
 def sort_key(value: str) -> tuple[int, float, str]:
@@ -53,6 +55,13 @@ class InspectorWindow:
         self._build()
         self.apply_theme(self._settings["theme"])
         self.root.report_callback_exception = self.report_error
+        self._drop_target = None
+        if sys.platform == "win32":
+            self._drop_target = WindowsFileDropTarget(
+                self.root.winfo_id(),
+                lambda paths: self.root.after(0, self._open_dropped_files, paths),
+            )
+            self.root.bind("<Destroy>", self._close_drop_target, add="+")
         self.root.after(100, self._poll_results)
 
     def report_error(self, exc_type, exc, tb) -> None:
@@ -160,7 +169,7 @@ class InspectorWindow:
         self._build_menus()
 
         self.status = tk.StringVar(
-            value="Select an authorized .exe or .dll file. Analysis tools never execute the sample."
+            value="Select or drop one authorized .exe or .dll file. Analysis tools never execute the sample."
         )
         ttk.Label(self.root, textvariable=self.status, padding=(10, 0, 10, 8)).pack(fill=tk.X)
 
@@ -319,6 +328,16 @@ class InspectorWindow:
             self.recent_menu.add_command(label=path, command=lambda path=path: self.open_file(path))
         if not recent:
             self.recent_menu.add_command(label="(none)", state=tk.DISABLED)
+
+    def _open_dropped_files(self, paths: tuple[str, ...]) -> None:
+        if len(paths) != 1:
+            self.status.set("Drop one executable at a time.")
+            return
+        self.open_file(paths[0])
+
+    def _close_drop_target(self, event: tk.Event) -> None:
+        if event.widget is self.root and self._drop_target is not None:
+            self._drop_target.close()
 
     def _analysis_buttons(self) -> tuple[ttk.Button, ...]:
         return (

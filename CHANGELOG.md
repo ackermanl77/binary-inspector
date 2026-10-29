@@ -17,6 +17,7 @@ All notable changes to Binary Inspector. The format follows
   analysis with a `summary.csv`, and optional YARA scanning.
 - Authenticode verification, including files signed through a Windows security catalog.
 - Import of sandbox behaviour reports, and optional Rizin / ILSpyCmd integration.
+- On Windows, drop one executable onto the window to open it for static analysis.
 - An error log: an unexpected error is shown in a dialog and written to `error.log` next to
   `settings.json` (the windowed exe has no console).
 - A once-per-launch update check against the project's GitHub Releases (update.json) (`update_check.py`).
