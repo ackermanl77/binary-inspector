@@ -12,7 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
-from . import __version__, errors, findings, settings, update_check
+from . import __version__, errors, findings, navigate, settings, update_check
 from .external_tools import decompile_dotnet, disassemble_native
 from .pe import Analysis, PEFormatError, analyze_file
 from .sandbox_report import SandboxReportError, load_sandbox_report
@@ -52,6 +52,11 @@ class InspectorWindow:
         self._extensions: dict[str, dict[str, Any]] = {}
         self._sort_state: dict[str, tuple[str, bool]] = {}
         self._tree_tables: set[str] = set()  # tables with a tree column (#0) to copy too
+        # Per-table filters (UI5): the filter text, and the top-level rows it hides (detached).
+        self._filters: dict[str, tk.StringVar] = {}
+        self._hidden_rows: dict[str, list[str]] = {}
+        self._tab_filters: dict[str, ttk.Entry] = {}  # tab frame -> its filter entry, for Ctrl+F
+        self._hex_offset = 0
         self._build()
         self.apply_theme(self._settings["theme"])
         self.root.report_callback_exception = self.report_error
@@ -87,9 +92,11 @@ class InspectorWindow:
 
     _PALETTES = {
         "light": {"bg": "#f3f3f3", "fg": "#1b1b1b", "field": "#ffffff", "select": "#cfe0fc", "selected_fg": "#1b1b1b",
-                  "accent": "#0b57d0", "warn": "#a33a00", "ok": "#1d6b2f", "border": "#c8c8c8"},
+                  "accent": "#0b57d0", "warn": "#a33a00", "ok": "#1d6b2f", "border": "#c8c8c8",
+                  "sections": ("#0b57d0", "#1d6b2f", "#a33a00", "#7b2fbf")},
         "dark": {"bg": "#202124", "fg": "#e8eaed", "field": "#2b2c30", "select": "#3d5a99", "selected_fg": "#ffffff",
-                 "accent": "#8ab4f8", "warn": "#ffb070", "ok": "#81c995", "border": "#44464b"},
+                 "accent": "#8ab4f8", "warn": "#ffb070", "ok": "#81c995", "border": "#44464b",
+                 "sections": ("#8ab4f8", "#81c995", "#ffb070", "#d7aefb")},
     }
 
     def apply_theme(self, choice: str) -> None:
@@ -133,8 +140,12 @@ class InspectorWindow:
         style.map("Treeview", background=[("selected", palette["select"])],
                   foreground=[("selected", palette["selected_fg"])])
         self.root.configure(background=palette["bg"])
-        for text in (self.output, self.tools_output):
+        for text in (self.output, self.tools_output, self.hex_output):
             text.configure(background=palette["field"], foreground=palette["fg"], insertbackground=palette["fg"])
+        # Hex tab: each section's offsets in its own colour, and the marked line as a selection.
+        for index, colour in enumerate(palette["sections"]):
+            self.hex_output.tag_configure(f"section{index}", foreground=colour)
+        self.hex_output.tag_configure("mark", background=palette["select"], foreground=palette["selected_fg"])
         self.findings_table.tag_configure(findings.WARN, foreground=palette["warn"])
         self.findings_table.tag_configure(findings.OK, foreground=palette["ok"])
         settings.save(self._settings)
@@ -183,21 +194,26 @@ class InspectorWindow:
             self._tab("Sections"),
             (("Name", 90), ("RVA", 90), ("File offset", 90), ("Virtual size", 100), ("Raw size", 100),
              ("Entropy", 70), ("Flags", 260), ("SHA-256", 480)),
+            filterable=True,
         )
         self.imports_table = self._table(
-            self._tab("Imports"), (("Kind", 90), ("Functions", 90)), tree_heading="Library / function"
+            self._tab("Imports"), (("Kind", 90), ("Functions", 90)), tree_heading="Library / function",
+            filterable=True,
         )
         self.exports_table = self._table(
-            self._tab("Exports"), (("Name", 360), ("Ordinal", 80), ("RVA", 100), ("Forwarder", 300))
+            self._tab("Exports"), (("Name", 360), ("Ordinal", 80), ("RVA", 100), ("Forwarder", 300)),
+            filterable=True,
         )
         self.resources_table = self._table(
             self._tab("Resources"),
             (("Name / value", 420), ("Language", 80), ("Size", 90), ("File offset", 100)),
-            tree_heading="Type / version field",
+            tree_heading="Type / version field", filterable=True,
         )
-        self.security_table = self._table(self._tab("Security"), (("Property", 300), ("Value", 600)))
+        self.security_table = self._table(
+            self._tab("Security"), (("Property", 300), ("Value", 600)), filterable=True
+        )
         self.dotnet_table = self._table(
-            self._tab(".NET"), (("Value", 640),), tree_heading="Property / reference"
+            self._tab(".NET"), (("Value", 640),), tree_heading="Property / reference", filterable=True
         )
         strings_tab = self._tab("Strings")
         filter_row = ttk.Frame(strings_tab, padding=(0, 4))
@@ -218,9 +234,19 @@ class InspectorWindow:
         self.strings_count = tk.StringVar()
         ttk.Label(filter_row, textvariable=self.strings_count).pack(side=tk.LEFT, padx=(10, 0))
         self.strings_table = self._table(strings_tab, (("Kind", 80), ("String", 900)))
+        self._tab_filters[str(strings_tab)] = filter_entry
+        self._build_hex_tab()
         self.tools_output = self._text(self._tab("Tools"))
         self.output = self._text(self._tab("Full report"))
-        self.root.bind("<Control-f>", lambda _event: self._focus_strings_filter(filter_entry))
+        self.root.bind("<Control-f>", lambda _event: self._focus_filter(filter_entry))
+        self.root.bind("<Control-g>", lambda _event: self.go_to())
+        # Ctrl+1 ... Ctrl+9: the first nine tabs (UI6).
+        for number in range(1, 10):
+            self.root.bind(f"<Control-Key-{number}>", lambda _event, n=number: self._select_tab(n - 1))
+        # Double-click a section: its bytes in the Hex tab (UI3).
+        self.sections_table.bind("<Double-1>", lambda _event: self._show_selected_section())
+        self.facts_table.bind("<Double-1>", lambda _event: self._open_start_row())
+        self._show_start()
 
     def _px(self, pixels: int) -> int:
         return round(pixels * self._scale)
@@ -230,7 +256,15 @@ class InspectorWindow:
         self.notebook.add(frame, text=title)
         return frame
 
-    def _table(self, parent, columns, tree_heading: str | None = None, height: int | None = None) -> ttk.Treeview:
+    def _table(self, parent, columns, tree_heading: str | None = None, height: int | None = None,
+               filterable: bool = False) -> ttk.Treeview:
+        if filterable:
+            filter_row = ttk.Frame(parent, padding=(0, 4))
+            filter_row.pack(fill=tk.X)
+            ttk.Label(filter_row, text="Filter:").pack(side=tk.LEFT)
+            text = tk.StringVar()
+            entry = ttk.Entry(filter_row, textvariable=text, width=40)
+            entry.pack(side=tk.LEFT, padx=(6, 0))
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.BOTH, expand=height is None, pady=(0, 4))
         names = [name for name, _width in columns]
@@ -255,7 +289,175 @@ class InspectorWindow:
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         tree.bind("<Control-c>", lambda _event: self._copy_rows(tree))
+        if filterable:
+            self._filters[str(tree)] = text
+            self._tab_filters[str(parent)] = entry
+            text.trace_add("write", lambda *_: self._apply_filter(tree))
         return tree
+
+    # ---- filters on every table (UI5) ----
+
+    def _apply_filter(self, tree: ttk.Treeview) -> None:
+        """Shows the top-level rows whose cells, or whose child rows' cells, contain the filter
+        text (any case); the rest are detached until the filter changes."""
+        key = str(tree)
+        for index, item in enumerate(self._hidden_rows.pop(key, [])):
+            if tree.exists(item):
+                tree.reattach(item, "", tk.END)
+        needle = self._filters[key].get().strip().lower() if key in self._filters else ""
+        if not needle:
+            return
+
+        def text_of(item: str) -> str:
+            cells = [str(tree.item(item, "text"))] + [str(value) for value in tree.item(item, "values")]
+            return " ".join(cells + [text_of(child) for child in tree.get_children(item)]).lower()
+
+        hidden = [item for item in tree.get_children("") if needle not in text_of(item)]
+        for item in hidden:
+            tree.detach(item)
+        self._hidden_rows[key] = hidden
+
+    def _focus_filter(self, strings_entry: ttk.Entry) -> None:
+        """Ctrl+F: the open tab's filter, or the Strings filter from a tab without one."""
+        entry = self._tab_filters.get(self.notebook.select())
+        if entry is None:
+            self.notebook.select(strings_entry.master.master)  # the Strings tab
+            entry = strings_entry
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+
+    def _select_tab(self, index: int) -> None:
+        tabs = self.notebook.tabs()
+        if index < len(tabs):
+            self.notebook.select(tabs[index])
+
+    # ---- start screen (UI7) ----
+
+    def _show_start(self) -> None:
+        """Before a file is open, the Summary table says how to open one and lists recent files
+        (double-click one to open it)."""
+        if self._analysis is not None:
+            return
+        self.facts_table.delete(*self.facts_table.get_children(""))
+        self.facts_table.insert("", tk.END, values=("Open a file", "Ctrl+O, File > Open executable, or drop an "
+                                                    ".exe / .dll on this window"))
+        for path in self._settings["recent"][:10]:
+            self.facts_table.insert("", tk.END, values=("Recent (double-click)", path), tags=("recent",))
+
+    def _open_start_row(self) -> None:
+        if self._analysis is not None:
+            return
+        for item in self.facts_table.selection():
+            if "recent" in self.facts_table.item(item, "tags"):
+                self.open_file(self.facts_table.set(item, "Value"))
+                return
+
+    # ---- Hex view and Go to (UI3, UI4) ----
+
+    def _build_hex_tab(self) -> None:
+        tab = self._tab("Hex")
+        self.hex_tab = tab
+        bar = ttk.Frame(tab, padding=(0, 4))
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Button(bar, text="Go to... (Ctrl+G)", command=self.go_to).pack(side=tk.LEFT)
+        ttk.Button(bar, text="< Previous", command=lambda: self.show_hex(self._hex_offset - navigate.HEX_PAGE_BYTES)
+                   ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="Next >", command=lambda: self.show_hex(self._hex_offset + navigate.HEX_PAGE_BYTES)
+                   ).pack(side=tk.LEFT, padx=(4, 0))
+        self.hex_where = tk.StringVar(value="Open a file to see its bytes.")
+        ttk.Label(bar, textvariable=self.hex_where).pack(side=tk.LEFT, padx=(10, 0))
+        body = ttk.Frame(tab)
+        body.grid(row=1, column=0, sticky="nsew")
+        tab.rowconfigure(1, weight=1)
+        tab.columnconfigure(0, weight=1)
+        self.hex_output = self._text(body)
+
+    def show_hex(self, offset: int, mark: int | None = None) -> None:
+        """One page of the file from the page holding `offset`, read from disk (the sample is never
+        loaded whole for this); `mark` highlights one byte's line."""
+        if self._analysis is None or self._input_path is None:
+            return
+        size = self._analysis.file_size
+        start = navigate.page_start(max(0, min(offset, max(0, size - 1))))
+        try:
+            with open(self._input_path, "rb") as handle:
+                handle.seek(start)
+                data = handle.read(navigate.HEX_PAGE_BYTES)
+        except OSError as exc:
+            self.hex_where.set(f"Can't read the file: {exc}")
+            return
+        self._hex_offset = start
+        self._set_text(self.hex_output, "\n".join(navigate.hex_lines(data, start)))
+        sections = [section.name for section in self._analysis.sections]
+        shown: list[str] = []
+        for line in range((len(data) + navigate.HEX_BYTES_PER_LINE - 1) // navigate.HEX_BYTES_PER_LINE):
+            name = navigate.locate(self._analysis, start + line * navigate.HEX_BYTES_PER_LINE, "offset").section
+            where = {"": "headers", "(none)": "no section"}.get(name, name)
+            if not shown or shown[-1] != where:
+                shown.append(where)
+            if name in sections:
+                self.hex_output.tag_add(f"section{sections.index(name) % 4}", f"{line + 1}.0", f"{line + 1}.8")
+        self.hex_where.set(f"0x{start:X}-0x{start + len(data) - 1:X} of 0x{size:X} bytes ({', '.join(shown)})")
+        if mark is not None and start <= mark < start + len(data):
+            line = (mark - start) // navigate.HEX_BYTES_PER_LINE + 1
+            self.hex_output.tag_add("mark", f"{line}.0", f"{line}.end")
+            self.hex_output.see(f"{line}.0")
+
+    def _show_selected_section(self) -> None:
+        if self._analysis is None:
+            return
+        for item in self.sections_table.selection():
+            name = self.sections_table.set(item, "Name")
+            section = next((s for s in self._analysis.sections if s.name == name), None)
+            if section is not None and section.raw_size:
+                self.notebook.select(self.hex_tab)
+                self.show_hex(section.raw_offset, mark=section.raw_offset)
+            return
+
+    def go_to(self) -> None:
+        """Ctrl+G: an RVA, virtual address or file offset -> where it is, shown in the Hex tab."""
+        if self._analysis is None:
+            self.status.set("Open a file first, then Go to an address.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Go to")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Address (hex; #123 for decimal):").grid(row=0, column=0, columnspan=3, sticky="w")
+        value = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=value, width=28)
+        entry.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 8))
+        kind = tk.StringVar(value="rva")
+        for column, (key, label) in enumerate((("rva", "RVA"), ("va", "Virtual address"), ("offset", "File offset"))):
+            ttk.Radiobutton(frame, text=label, value=key, variable=kind).grid(row=2, column=column, sticky="w")
+        message = tk.StringVar()
+        ttk.Label(frame, textvariable=message, foreground="#a33a00").grid(row=3, column=0, columnspan=3, sticky="w")
+
+        def go(_event=None) -> None:
+            try:
+                location = navigate.locate(self._analysis, navigate.parse_address(value.get()), kind.get())
+            except ValueError as exc:
+                message.set(str(exc) if "invalid literal" not in str(exc) else "That isn't a hex number.")
+                return
+            dialog.destroy()
+            self.status.set(navigate.describe(location, self._analysis.image_base))
+            if location.section and location.section != "(none)":
+                for item in self.sections_table.get_children(""):
+                    if self.sections_table.set(item, "Name") == location.section:
+                        self.sections_table.selection_set(item)
+            if location.offset is not None:
+                self.notebook.select(self.hex_tab)
+                self.show_hex(location.offset, mark=location.offset)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Go", command=go).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=(6, 0))
+        entry.bind("<Return>", go)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        entry.focus_set()
 
     def _text(self, parent) -> tk.Text:
         text = tk.Text(parent, wrap=tk.NONE, font=("Consolas", 10), state=tk.DISABLED)
@@ -294,10 +496,6 @@ class InspectorWindow:
             self.root.clipboard_append("\n".join(rows))
             self.status.set(f"Copied {len(rows)} row(s).")
 
-    def _focus_strings_filter(self, entry: ttk.Entry) -> None:
-        self.notebook.select(entry.master.master)  # the Strings tab
-        entry.focus_set()
-
     def _build_menus(self) -> None:
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=False)
@@ -315,11 +513,100 @@ class InspectorWindow:
         for value, label in (("system", "Theme: as Windows"), ("light", "Theme: light"), ("dark", "Theme: dark")):
             view_menu.add_radiobutton(label=label, value=value, variable=self.theme_choice,
                                       command=lambda value=value: self.apply_theme(value))
+        view_menu.add_separator()
+        view_menu.add_command(label="Go to address...", accelerator="Ctrl+G", command=self.go_to)
+        view_menu.add_command(label="Command list...", accelerator="Ctrl+Shift+P", command=self.show_commands)
+        view_menu.add_command(label="Keyboard shortcuts", command=self.show_shortcuts)
         menubar.add_cascade(label="View", menu=view_menu)
         self.root.configure(menu=menubar)
+        self._menus = (file_menu, view_menu)
         self.root.bind("<Control-o>", lambda _event: self.open_file())
         self.root.bind("<Control-s>", lambda _event: self.save_report())
+        self.root.bind("<Control-P>", lambda _event: self.show_commands())  # Ctrl+Shift+P
         self._fill_recent_menu()
+
+    def commands(self) -> list[tuple[str, object]]:
+        """Everything the command list offers: the menu commands, the enabled toolbar buttons and
+        the tabs, as (label, action)."""
+        found: list[tuple[str, object]] = []
+        for menu in self._menus:
+            for index in range(menu.index(tk.END) + 1):
+                if menu.type(index) in ("command", "radiobutton") and menu.entrycget(index, "state") != tk.DISABLED:
+                    label = menu.entrycget(index, "label").rstrip(".")
+                    found.append((label, lambda menu=menu, index=index: menu.invoke(index)))
+        labels = {label.lower() for label, _action in found}
+        for button in (self.disassemble_button, self.decompile_button, self.verify_signature_button,
+                       self.sandbox_button, self.compare_button, self.yara_button):
+            label = button.cget("text").rstrip(".")
+            if label.lower() not in labels and not button.instate(["disabled"]):
+                found.append((label, button.invoke))
+        for tab in self.notebook.tabs():
+            found.append((f"Tab: {self.notebook.tab(tab, 'text')}", lambda tab=tab: self.notebook.select(tab)))
+        return found
+
+    def show_commands(self) -> None:
+        """Ctrl+Shift+P: type part of a command's name, Enter runs the highlighted one."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Command list")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=8)
+        frame.pack(fill=tk.BOTH, expand=True)
+        query = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=query, width=50)
+        entry.pack(fill=tk.X)
+        listbox = tk.Listbox(frame, height=14, activestyle="none", exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        everything = self.commands()
+        shown: list[tuple[str, object]] = []
+
+        def refill(*_args) -> None:
+            words = query.get().lower().split()
+            shown[:] = [command for command in everything if all(word in command[0].lower() for word in words)]
+            listbox.delete(0, tk.END)
+            for label, _action in shown:
+                listbox.insert(tk.END, label)
+            if shown:
+                listbox.selection_set(0)
+
+        def move(step: int) -> str:
+            if shown:
+                current = (listbox.curselection() or (0,))[0]
+                listbox.selection_clear(0, tk.END)
+                listbox.selection_set(max(0, min(len(shown) - 1, current + step)))
+                listbox.see(listbox.curselection()[0])
+            return "break"
+
+        def run(_event=None) -> None:
+            selection = listbox.curselection()
+            if selection:
+                action = shown[selection[0]][1]
+                dialog.destroy()
+                action()
+
+        query.trace_add("write", refill)
+        entry.bind("<Down>", lambda _event: move(1))
+        entry.bind("<Up>", lambda _event: move(-1))
+        entry.bind("<Return>", run)
+        listbox.bind("<Double-1>", run)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        refill()
+        entry.focus_set()
+
+    SHORTCUTS = (
+        ("Ctrl+O", "Open an executable"),
+        ("Ctrl+S", "Save the report"),
+        ("Ctrl+F", "Filter the open tab's table (Strings from a tab without one)"),
+        ("Ctrl+G", "Go to an RVA, virtual address or file offset (shown in the Hex tab)"),
+        ("Ctrl+1 ... Ctrl+9", "Open the first nine tabs (Summary ... Hex)"),
+        ("Ctrl+Shift+P", "Command list: every menu command, tool and tab by name"),
+        ("Ctrl+C", "Copy the selected table rows"),
+        ("Double-click a section", "Its bytes in the Hex tab"),
+    )
+
+    def show_shortcuts(self) -> None:
+        width = max(len(keys) for keys, _action in self.SHORTCUTS)
+        messagebox.showinfo("Keyboard shortcuts", "\n".join(f"{keys.ljust(width)}   {action}"
+                                                             for keys, action in self.SHORTCUTS), parent=self.root)
 
     def _fill_recent_menu(self) -> None:
         self.recent_menu.delete(0, tk.END)
@@ -359,6 +646,7 @@ class InspectorWindow:
         self._fill_recent_menu()
         self._analysis = None
         self._input_path = path
+        self._hex_offset = 0
         self._extensions = {}
         for button in self._analysis_buttons():
             button.configure(state=tk.DISABLED)
@@ -530,6 +818,10 @@ class InspectorWindow:
             return
         tools = self._format_extensions()
         self._fill_tables(self._analysis)
+        for tree in self._tables():
+            if str(tree) in self._filters:
+                self._apply_filter(tree)
+        self.show_hex(self._hex_offset if self._hex_offset < self._analysis.file_size else 0)
         self._set_text(
             self.tools_output,
             "\n".join(tools).lstrip("\n")
@@ -539,7 +831,8 @@ class InspectorWindow:
 
     def _clear_tables(self) -> None:
         for tree in self._tables():
-            tree.delete(*tree.get_children(""))
+            hidden = [item for item in self._hidden_rows.pop(str(tree), []) if tree.exists(item)]
+            tree.delete(*tree.get_children(""), *hidden)
         self._set_text(self.tools_output, "")
 
     def _tables(self) -> tuple[ttk.Treeview, ...]:

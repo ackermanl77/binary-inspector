@@ -102,7 +102,8 @@ class WindowTests(unittest.TestCase):
         tabs = [window.notebook.tab(tab, "text") for tab in window.notebook.tabs()]
         self.assertEqual(
             tabs,
-            ["Summary", "Sections", "Imports", "Exports", "Resources", "Security", ".NET", "Strings", "Tools", "Full report"],
+            ["Summary", "Sections", "Imports", "Exports", "Resources", "Security", ".NET", "Strings", "Hex", "Tools",
+             "Full report"],
         )
         facts = dict(_values(window.facts_table))
         self.assertEqual(facts["File"], "sample.exe")
@@ -172,6 +173,61 @@ class WindowTests(unittest.TestCase):
         self.assertIn("AUTHENTICODE TRUST VERIFICATION", self.window.tools_output.get("1.0", "end"))
         self.assertTrue(any("Not signed" in row[1] for row in _values(self.window.findings_table)))
         self.assertEqual(dict(_values(self.window.facts_table))["Signature"], "unsigned")
+
+    def test_every_table_filter_hides_rows_and_survives_a_refill(self):
+        self._show(make_pe32())
+        window, tree = self.window, self.window.imports_table
+        window._filters[str(tree)].set("exitprocess")  # matches a child row: its library stays
+        self.assertEqual(len(tree.get_children("")), 1)
+        window._filters[str(tree)].set("nothing-like-this")
+        self.assertEqual(tree.get_children(""), ())
+        self._show(make_pe32())  # refilled with the filter still typed
+        self.assertEqual(tree.get_children(""), ())
+        window._filters[str(tree)].set("")
+        self.assertEqual(len(tree.get_children("")), 1)
+        for table in (window.sections_table, window.exports_table, window.resources_table, window.security_table):
+            self.assertIn(str(table), window._filters)
+
+    def test_ctrl_number_selects_a_tab(self):
+        self.window._select_tab(8)
+        self.assertEqual(self.window.notebook.tab(self.window.notebook.select(), "text"), "Hex")
+        self.window._select_tab(40)  # no such tab: nothing changes
+        self.assertEqual(self.window.notebook.tab(self.window.notebook.select(), "text"), "Hex")
+
+    def test_the_command_list_offers_menus_enabled_tools_and_tabs(self):
+        labels = [label for label, _action in self.window.commands()]
+        self.assertIn("Open executable", labels)
+        self.assertIn("Theme: dark", labels)
+        self.assertIn("Tab: Hex", labels)
+        self.assertNotIn("YARA scan", labels)  # disabled until a file is open
+        self._show(make_pe32())
+        self.assertIn("YARA scan", [label for label, _action in self.window.commands()])
+        dict(self.window.commands())["Tab: Strings"]()
+        self.assertEqual(self.window.notebook.tab(self.window.notebook.select(), "text"), "Strings")
+
+    def test_the_hex_tab_reads_the_file_a_page_at_a_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, "sample.exe")
+            path.write_bytes(make_pe32())
+            self.window._input_path = path
+            self._show(path.read_bytes())
+            self.window.show_hex(0x210, mark=0x210)
+            dump = self.window.hex_output.get("1.0", "end")
+            self.assertTrue(dump.startswith("00000000  4D 5A"))  # "MZ", page from offset 0
+            self.assertIn("0x0-0x5FF of 0x600 bytes (headers, .rdata)", self.window.hex_where.get())
+            self.assertEqual(self.window.hex_output.tag_names("33.0"), ("section0",))  # 0x200: .rdata starts
+            self.assertEqual(self.window.hex_output.tag_names("32.0"), ())  # headers: no section colour
+            self.assertEqual(self.window.hex_output.tag_ranges("mark")[0].string, "34.0")  # 0x210 // 16 + 1
+
+    def test_the_start_screen_lists_recent_files_until_one_is_open(self):
+        window = self.window
+        window._settings["recent"] = [r"C:\samples\a.exe"]
+        window._show_start()
+        rows = _values(window.facts_table)
+        self.assertEqual(rows[0][0], "Open a file")
+        self.assertEqual(rows[1], ("Recent (double-click)", r"C:\samples\a.exe"))
+        self._show(make_pe32())
+        self.assertNotIn("Open a file", dict(_values(window.facts_table)))
 
 
 @unittest.skipIf(_ROOT is None, "no Tk display")
