@@ -11,6 +11,7 @@ import ctypes
 import os
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from ctypes import wintypes
@@ -43,6 +44,7 @@ class SignatureVerification:
     signer: str | None = None
     issuer: str | None = None
     catalog: str | None = None  # the catalog file that lists this file
+    signing_time_utc: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -54,15 +56,28 @@ def _status_for_result(
     signer: str | None = None,
     issuer: str | None = None,
     catalog: str | None = None,
+    signing_time_utc: str | None = None,
 ) -> SignatureVerification:
     code = result & 0xFFFFFFFF
-    found = {"source": source, "signer": signer, "issuer": issuer, "catalog": catalog}
+    found = {
+        "source": source,
+        "signer": signer,
+        "issuer": issuer,
+        "catalog": catalog,
+        "signing_time_utc": signing_time_utc,
+    }
+    timestamp_note = (
+        " The signing timestamp is signature metadata, not current certificate trust."
+        if signing_time_utc
+        else ""
+    )
     if code == 0:
         where = "the file's catalog signature" if source == "catalog" else "the signature"
         return SignatureVerification(
             "trusted",
             code,
-            f"Windows trust policy accepted {where}. Revocation was not checked; URL retrieval was disabled.",
+            f"Windows trust policy accepted {where}. Revocation was not checked; URL retrieval was disabled."
+            + timestamp_note,
             **found,
         )
     if code == _TRUST_E_NOSIGNATURE:
@@ -75,13 +90,15 @@ def _status_for_result(
         return SignatureVerification(
             "untrusted",
             code,
-            "Windows rejected the signature or certificate chain. This is not a malware verdict.",
+            "Windows rejected the signature or certificate chain. This is not a malware verdict."
+            + timestamp_note,
             **found,
         )
     return SignatureVerification(
         "unable_to_verify",
         code,
-        "Windows could not complete trust verification. Review the status code and system trust configuration.",
+        "Windows could not complete trust verification. Review the status code and system trust configuration."
+        + timestamp_note,
         **found,
     )
 
@@ -146,6 +163,25 @@ class _CryptProviderCert(ctypes.Structure):
     _fields_ = [("cbStruct", wintypes.DWORD), ("pCert", ctypes.c_void_p)]
 
 
+class _FileTime(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+
+class _CryptProviderSigner(ctypes.Structure):
+    _fields_ = [
+        ("cbStruct", wintypes.DWORD),
+        ("sftVerifyAsOf", _FileTime),
+        ("csCertChain", wintypes.DWORD),
+        ("pasCertChain", ctypes.c_void_p),
+        ("dwSignerType", wintypes.DWORD),
+        ("psSigner", ctypes.c_void_p),
+        ("dwError", wintypes.DWORD),
+        ("csCounterSigners", wintypes.DWORD),
+        ("pasCounterSigners", ctypes.c_void_p),
+        ("pChainContext", ctypes.c_void_p),
+    ]
+
+
 class _CatalogInfo(ctypes.Structure):
     _fields_ = [("cbStruct", wintypes.DWORD), ("wszCatalogFile", ctypes.c_wchar * 260)]
 
@@ -162,8 +198,20 @@ def _certificate_name(crypt32, certificate: int, issuer: bool) -> str | None:
     return buffer.value if length > 1 and buffer.value else None
 
 
-def _signer_names(trust, state) -> tuple[str | None, str | None]:
-    """The leaf signing certificate's subject and issuer from a verified trust state."""
+def _filetime_utc(value: _FileTime) -> str | None:
+    ticks = (value.dwHighDateTime << 32) | value.dwLowDateTime
+    if not ticks:
+        return None
+    try:
+        return (
+            datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=ticks // 10)
+        ).isoformat()
+    except OverflowError:
+        return None
+
+
+def _signer_details(trust, state) -> tuple[str | None, str | None, str | None]:
+    """Read signer names and a Windows-recognized timestamp signer from a trust state."""
     provider_data = trust.WTHelperProvDataFromStateData
     provider_data.argtypes = [wintypes.HANDLE]
     provider_data.restype = ctypes.c_void_p
@@ -177,14 +225,25 @@ def _signer_names(trust, state) -> tuple[str | None, str | None]:
     provider = provider_data(state) if state else None
     signer = signer_from_chain(provider, 0, False, 0) if provider else None
     certificate = cert_from_chain(signer, 0) if signer else None
-    if not certificate or not certificate.contents.pCert:
-        return None, None
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    leaf = certificate.contents.pCert
-    return _certificate_name(crypt32, leaf, False), _certificate_name(crypt32, leaf, True)
+    if certificate and certificate.contents.pCert:
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        leaf = certificate.contents.pCert
+        subject, issuer = _certificate_name(crypt32, leaf, False), _certificate_name(crypt32, leaf, True)
+    else:
+        subject = issuer = None
+
+    timestamp = None
+    counter = signer_from_chain(provider, 0, True, 0) if provider and signer else None
+    if counter:
+        timestamp_signer = ctypes.cast(counter, ctypes.POINTER(_CryptProviderSigner)).contents
+        if timestamp_signer.dwSignerType == 0x10:  # SGNR_TYPE_TIMESTAMP
+            timestamp = _filetime_utc(timestamp_signer.sftVerifyAsOf)
+    return subject, issuer, timestamp
 
 
-def _win_verify_trust(trust, union_choice: int, union) -> tuple[int, str | None, str | None]:
+def _win_verify_trust(
+    trust, union_choice: int, union
+) -> tuple[int, str | None, str | None, str | None]:
     """WinVerifyTrust (no UI, no revocation, cached URL data only) and the signer it found."""
     action = _Guid.of(_WINTRUST_ACTION_GENERIC_VERIFY_V2)
     data = _WinTrustData(
@@ -205,15 +264,15 @@ def _win_verify_trust(trust, union_choice: int, union) -> tuple[int, str | None,
     verify = trust.WinVerifyTrust
     verify.argtypes = [wintypes.HWND, ctypes.POINTER(_Guid), ctypes.POINTER(_WinTrustData)]
     verify.restype = ctypes.c_long
-    signer = issuer = None
+    signer = issuer = signing_time = None
     try:
         result = verify(ctypes.c_void_p(-1), ctypes.byref(action), ctypes.byref(data))
         if (result & 0xFFFFFFFF) != _TRUST_E_NOSIGNATURE:
-            signer, issuer = _signer_names(trust, data.hWVTStateData)
+            signer, issuer, signing_time = _signer_details(trust, data.hWVTStateData)
     finally:
         data.dwStateAction = 2  # WTD_STATEACTION_CLOSE
         verify(ctypes.c_void_p(-1), ctypes.byref(action), ctypes.byref(data))
-    return result, signer, issuer
+    return result, signer, issuer, signing_time
 
 
 def _verify_catalog(trust, path: Path) -> SignatureVerification | None:
@@ -275,8 +334,10 @@ def _verify_catalog(trust, path: Path) -> SignatureVerification | None:
                     None,
                     admin,
                 )
-                result, signer, issuer = _win_verify_trust(trust, _WTD_CHOICE_CATALOG, member)
-                return _status_for_result(result, "catalog", signer, issuer, info.wszCatalogFile)
+                result, signer, issuer, signing_time = _win_verify_trust(trust, _WTD_CHOICE_CATALOG, member)
+                return _status_for_result(
+                    result, "catalog", signer, issuer, info.wszCatalogFile, signing_time
+                )
             finally:
                 release_catalog(admin, context, 0)
         finally:
@@ -287,12 +348,12 @@ def _verify_catalog(trust, path: Path) -> SignatureVerification | None:
 def _verify_windows(path: Path) -> SignatureVerification:
     trust = ctypes.WinDLL("wintrust", use_last_error=True)
     file_info = _WinTrustFileInfo(ctypes.sizeof(_WinTrustFileInfo), str(path), None, None)
-    result, signer, issuer = _win_verify_trust(trust, _WTD_CHOICE_FILE, file_info)
+    result, signer, issuer, signing_time = _win_verify_trust(trust, _WTD_CHOICE_FILE, file_info)
     if (result & 0xFFFFFFFF) == _TRUST_E_NOSIGNATURE:
         catalog = _verify_catalog(trust, path)
         if catalog is not None:
             return catalog
-    return _status_for_result(result, "embedded", signer, issuer)
+    return _status_for_result(result, "embedded", signer, issuer, signing_time_utc=signing_time)
 
 
 def verify_authenticode(path: str | os.PathLike[str]) -> SignatureVerification:

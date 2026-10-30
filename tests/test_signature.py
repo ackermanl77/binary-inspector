@@ -6,10 +6,11 @@ import io
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from binary_inspector.signature import _status_for_result, verify_authenticode
+from binary_inspector.signature import _FileTime, _filetime_utc, _status_for_result, verify_authenticode
 from binary_inspector.__main__ import main
 from tests.test_pe import make_pe32
 
@@ -59,6 +60,17 @@ class SignatureTests(unittest.TestCase):
         self.assertIn("catalog signature", result.detail)
         self.assertEqual(result.to_dict()["signer"], "Microsoft Windows")
         self.assertIsNone(_status_for_result(0x800B0100, "embedded").source)  # unsigned: no source
+
+    def test_windows_filetime_is_reported_as_signature_metadata_not_current_trust(self):
+        instant = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        ticks = int((instant - datetime(1601, 1, 1, tzinfo=timezone.utc)).total_seconds() * 10_000_000)
+        filetime = _FileTime(ticks & 0xFFFFFFFF, ticks >> 32)
+        timestamp = _filetime_utc(filetime)
+        self.assertEqual(timestamp, "2024-01-02T03:04:05+00:00")
+
+        result = _status_for_result(0, "embedded", signing_time_utc=timestamp)
+        self.assertEqual(result.to_dict()["signing_time_utc"], timestamp)
+        self.assertIn("not current certificate trust", result.detail)
 
 
 _SYSTEM32 = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32")

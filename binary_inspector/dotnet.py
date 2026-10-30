@@ -16,6 +16,8 @@ from dataclasses import dataclass
 MAX_STREAMS = 16
 MAX_ROWS = 1 << 24
 MAX_LISTED = 1000  # references, module refs and P/Invoke imports kept per list
+MAX_BUNDLE_FILES = 100_000
+_BUNDLE_MARKER = struct.pack("<I", 0x8B12B031)
 
 CLR_FLAGS = (
     (0x00000001, "IL_ONLY"),
@@ -124,6 +126,59 @@ class DotNetMetadata:
     method_count: int = 0
     table_rows: tuple[tuple[str, int], ...] = ()
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class DotNetBundle:
+    version: str
+    header_offset: int
+    embedded_file_count: int
+
+
+def detect_bundle(data: bytes, certificate_offset: int = 0, certificate_size: int = 0) -> DotNetBundle | None:
+    """Recognize a .NET single-file bundle from its apphost marker and bounded header."""
+    bundle_end = len(data)
+    if certificate_size and certificate_offset >= 0 and certificate_offset + certificate_size == len(data):
+        bundle_end = certificate_offset
+
+    marker_at = 0
+    while True:
+        marker_at = data.find(_BUNDLE_MARKER, marker_at, bundle_end)
+        if marker_at < 8:
+            return None
+        header_offset = struct.unpack_from("<q", data, marker_at - 8)[0]
+        if 0 < header_offset < bundle_end and header_offset + 12 <= bundle_end:
+            major, minor, count = struct.unpack_from("<IIi", data, header_offset)
+            if major in (1, 2, 6) and minor == 0 and 0 < count <= MAX_BUNDLE_FILES:
+                cursor = header_offset + 12
+                first = data[cursor]
+                cursor += 1
+                if first & 0x80:
+                    if cursor >= bundle_end or data[cursor] & 0x80:
+                        marker_at += len(_BUNDLE_MARKER)
+                        continue
+                    name_length = ((data[cursor] & 0x7F) << 7) | (first & 0x7F)
+                    cursor += 1
+                else:
+                    name_length = first
+                if not 0 < name_length <= 128 or cursor + name_length > bundle_end:
+                    marker_at += len(_BUNDLE_MARKER)
+                    continue
+                if major >= 2 and cursor + name_length + 40 > bundle_end:
+                    marker_at += len(_BUNDLE_MARKER)
+                    continue
+                if major >= 2:
+                    fixed = cursor + name_length
+                    locations = struct.unpack_from("<qqqqQ", data, fixed)
+                    deps_offset, deps_size, config_offset, config_size, _ = locations
+                    if any(
+                        offset < 0 or size < 0 or (offset and offset + size > bundle_end)
+                        for offset, size in ((deps_offset, deps_size), (config_offset, config_size))
+                    ):
+                        marker_at += len(_BUNDLE_MARKER)
+                        continue
+                return DotNetBundle(f"{major}.{minor}", header_offset, count)
+        marker_at += len(_BUNDLE_MARKER)
 
 
 _TABLE_NAMES = {

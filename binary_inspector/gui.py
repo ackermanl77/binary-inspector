@@ -862,6 +862,16 @@ class InspectorWindow:
              " / ".join(str(part) for part in (verification["status"], verification.get("source"),
                                                 verification.get("signer")) if part)),
         ]
+        if verification and verification.get("signing_time_utc"):
+            facts.append(("Signing timestamp (UTC)", verification["signing_time_utc"]))
+        if analysis.dotnet_bundle:
+            facts.append(
+                (
+                    ".NET single-file bundle",
+                    f"version {analysis.dotnet_bundle.version}; "
+                    f"{analysis.dotnet_bundle.embedded_file_count} embedded files",
+                )
+            )
         version = next((item.version_info for item in analysis.resources if item.version_info), {})
         for key in ("CompanyName", "ProductName", "FileDescription", "FileVersion", "OriginalFilename"):
             if key in version:
@@ -916,6 +926,17 @@ class InspectorWindow:
     def _fill_dotnet(self, analysis: Analysis) -> None:
         table = self.dotnet_table
         metadata = analysis.dotnet
+        bundle = analysis.dotnet_bundle
+        if bundle:
+            table.insert(
+                "",
+                tk.END,
+                text=".NET single-file bundle",
+                values=(
+                    f"version {bundle.version}; {bundle.embedded_file_count} embedded files; "
+                    f"header at 0x{bundle.header_offset:X}",
+                ),
+            )
         if metadata is None:
             table.insert("", tk.END, text="Not a .NET assembly", values=("",))
             return
@@ -1038,6 +1059,7 @@ class InspectorWindow:
                     ("signer", "Signer"),
                     ("issuer", "Issuer"),
                     ("catalog", "Catalog"),
+                    ("signing_time_utc", "Signing timestamp (UTC)"),
                 ):
                     if verification.get(key):
                         rendered.append(f"{label}: {verification[key]}")
@@ -1173,6 +1195,14 @@ class InspectorWindow:
         else:
             lines.append("(no CLR header)")
         metadata = analysis.dotnet
+        bundle = analysis.dotnet_bundle
+        if bundle:
+            lines.append(
+                f".NET single-file bundle: version {bundle.version}; "
+                f"{bundle.embedded_file_count} embedded files; header at 0x{bundle.header_offset:X}"
+            )
+        else:
+            lines.append(".NET single-file bundle: not detected")
         if metadata is not None:
             lines.append(metadata.error or (
                 f"Assembly {metadata.assembly_name} {metadata.assembly_version}, token "

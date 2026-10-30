@@ -146,6 +146,7 @@ class Analysis:
     api_hints: tuple[ApiHint, ...] = ()
     toolchain_hints: tuple[ToolchainHint, ...] = ()
     dotnet: DotNetMetadata | None = None
+    dotnet_bundle: dotnet.DotNetBundle | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation of this report."""
@@ -501,6 +502,7 @@ class _PE:
             checksum_computed=pe_checksum(self.data, optional_offset + 64),
             string_categories=string_categories,
             api_hints=triage.api_hints(tuple(self.imports) + tuple(delay_imports)),
+            dotnet_bundle=dotnet.detect_bundle(self.data, cert_offset, cert_size),
             dotnet=self._dotnet,
         )
         # The toolchain hints read the finished report (sections, strings, overlay, Rich header).
